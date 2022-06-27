@@ -1,0 +1,341 @@
+################  run SDM ::: Lycodon rufozonatus
+####  Packages
+options(java.parameters = "-Xmx1024m")  ## to prevent rJava memory error
+
+library(rJava)
+library(megaSDM)
+library(dismo)
+library(SDMtune)
+library(zeallot)
+library(ENMeval)
+library(raster)
+library(rgdal)
+library(ggplot2)
+library(dplyr)
+
+# load megaSDM vignette
+??megaSDM_vignette
+
+######   PART 1 ::: occurrence data   ######
+# make extent object
+ext <- c(100, 132, 18, 42)
+
+spplist <- c('Lycodon rufozonatus')
+OccurrenceCollection(spplist = spplist,
+                     output = './SDM/occurrences',
+                     trainingarea = ext)
+
+# map it out
+occs <- read.csv('./SDM/occurrences/Lycodon_rufozonatus.csv') %>% select(4,5,6)
+colnames(occs) <- c('species', 'long', 'lat')
+head(occs)
+
+basemap <- raster('D:/env layers/elev_worldclim/wc2.1_30s_elev.tif')
+basemap <- crop(basemap, ext)
+
+plot(basemap)
+points(occs[, c(2,3)])
+
+#### thin occurrences
+# 1 km
+occs_thin <- SDMtune::thinData(coords = occs, env = basemap, x = 'long', y = 'lat')
+
+# 5 km
+ras5 <- getData(name = 'worldclim', var = 'bio', res = 2.5)
+ras5 <- crop(ras5, ext)
+plot(ras5[[1]])
+
+occs_thin_5 <- SDMtune::thinData(coords = occs, env = ras5[[1]], x = 'long', y = 'lat')
+
+# 10 km
+ras10 <- getData(name = 'worldclim', var = 'bio', res = 5)
+ras10 <- crop(ras10, ext)
+plot(ras10[[1]])
+
+occs_thin_10 <- SDMtune::thinData(coords = occs, env = ras10[[1]], x = 'long', y = 'lat')
+
+plot(basemap)
+points(occs_thin_10[, c(2,3)], col = 'blue')
+### use 10 km thinned occ data for all downstream procedures
+
+######   PART 2 ::: environmental data   ######
+# climate
+clim <- stack(list.files(path = 'D:/env layers/worldclim', pattern = '.tif', full.names = T))
+clim <- crop(clim, ext)
+plot(clim[[1]])
+
+# elev
+elev <- raster('D:/env layers/elev_worldclim/wc2.1_30s_elev.tif')
+elev <- crop(elev, ext)
+plot(elev)
+
+# land cover
+land <- stack(list.files(path = 'D:/env layers/land cover', pattern = '.tif', full.names = T))
+(land <- dropLayer(land, c(1,3,4,7,8,9,11)))
+land <- crop(land, ext)
+plot(land[[2]])
+
+# stack'em all!
+envs <- stack(clim, elev, land)
+plot(envs[[1]])
+
+######   PART 3 ::: create calibration area   ######
+# first convert point data to equal area projections ::: this is ideal for buffering
+occs.sf <- sf::st_as_sf(occs_thin_10, coords = c('long','lat'),
+                        crs = raster::crs(envs))
+
+occs.sf <- sf::st_transform(occs.sf, crs = '+proj=eck4 +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs')
+
+# create buffers ::: 100 km around each occurence point
+occs.buf <- sf::st_buffer(occs.sf, dist = 100000) %>%
+  sf::st_union() %>%
+  sf::st_sf() %>%
+  sf::st_transform(crs = raster::crs(envs))
+  
+plot(envs[[1]])
+plot(occs.buf, border = 'blue', lwd = 3, add = T)
+
+# mask envs layers to calibration area
+envs_cal <- raster::mask(envs, occs.buf)
+plot(envs_cal[[1]])
+
+
+######   PART 4 ::: sample background points from within the calibration area   ######
+bg <- dismo::randomPoints(mask = envs_cal[[1]], n = 10000, p = occs_thin_10[, c(2,3)], excludep = T) %>% as.data.frame()
+colnames(bg) = colnames(occs_thin_10[, c(2,3)])
+head(bg)
+
+plot(envs[[1]])
+points(bg, col = 'blue')
+
+
+######   PART 5 ::: select environmental layers   ######
+## use SDMtune ::: run basic correlation tests using background data
+cor.bg <- prepareSWD(species = 'bgs', a = bg, env = envs_cal, categorical = NULL)
+plotCor(cor.bg, method = 'spearman', cor_th = 0.7)
+corVar(cor.bg, method = 'spearman', cor_th = 0.7)
+
+#### Step 1 ::: remove variables with low importance
+## first generate a default MaxEnt model
+data_def <- prepareSWD(species = 'lyco', p = occs_thin_10[, c(2,3)],
+                       a = bg, env = envs_cal, categorical = NULL)
+
+c(train, test) %<-% trainValTest(data_def, test = 0.3)
+(default_model <- train(method = 'Maxent', data = train))
+
+varImp(default_model, permut = 10)
+cat('Test TSS before', tss(default_model, test = test))
+
+## remove unimportant variables
+reduced_var_mod <- reduceVar(default_model, th = 1, metric = 'tss',
+                             test = test, permut = 10, use_jk = T, use_pc = T)
+
+cat('Test TSS after', tss(reduced_var_mod, test = test))
+
+#### Step 2 ::: remove highly correlated variables
+selected_var_mod <- varSel(reduced_var_mod, metric = 'tss', test = test,
+                           bg4cor = cor.bg, method = 'spearman', cor_th = 0.7,
+                           permut = 10, use_pc = T)
+
+## reorganize env data
+# calibration
+(envs_cal_sub <- stack(subset(envs_cal, c(11,13,15,17,20,22)))) 
+names(envs_cal_sub) <- c('bio19', 'bio3', 'bio5', 'bio7', 'elev', 'forest')
+plot(envs_cal_sub[[1]])
+
+# projection 
+(envs_proj <- stack(subset(envs, c(11,13,15,17,20,22))))
+names(envs_proj) <- c('bio19', 'bio3', 'bio5', 'bio7', 'elev', 'forest')
+plot(envs_proj[[1]])
+
+
+######   PART 6 ::: Model parameter tuning   ######
+## k-fold partitioning
+fold <- get.randomkfold(occs = occs_thin_10[, c(2,3)], bg = bg, k = 10)
+evalplot.grps(pts = occs_thin_10[, c(2,3)], pts.grp = fold$occs.grp, envs = envs_cal_sub[[1]])
+
+## run Eval ::: increase memory limits before running this line 
+memory.size(max = TRUE)    
+memory.size(max = FALSE)   
+memory.limit(size = NA)    
+memory.limit(size = 50000)  
+
+eval <- ENMevaluate(occs = occs_thin_10[, c(2,3)],
+                    envs = envs_cal_sub,
+                    bg = bg,
+                    tune.args = list(fc = c('L', 'LQ', 'H', 'LQH', 'LQHP', 'LQHPT'), rm = seq(0.5, 5, by = 0.5)),
+                    partitions = 'randomkfold',
+                    partition.settings = list(kfolds = 10),
+                    algorithm = 'maxent.jar',
+                    doClamp = T)
+
+res <- eval.results(eval)
+
+## select optimal parameters I ::: min. delta AICc
+(opt.aicc <- res %>% filter(delta.AICc == 0))
+
+mod.aicc <- eval.predictions(eval)[[opt.aicc$tune.args]]
+plot(mod.aicc)
+
+## select optimal paramters II ::: min. OR & max. AUC.val
+(opt.seq <- res %>% 
+    filter(auc.val.avg == max(auc.val.avg)) %>%
+    filter(or.10p.avg == min(or.10p.avg)))
+
+mod.seq <- eval.predictions(eval)[[opt.seq$tune.args]]
+plot(mod.seq)
+
+
+######   PART 7 ::: SDM fitting & projection using dismo  ######
+## calibration
+sdm.calib <- dismo::maxent(x = envs_cal_sub,
+                           p = occs_thin_10[, c(2,3)],
+                           a = bg,
+                           path = './SDM/maxent_models2',
+                           args = c('responsecurves=true',
+                                    'pictures=true',
+                                    'jackknife=true',
+                                    'outputformat=cloglog',
+                                    'outputfiletype=asc',
+                                    'randomseed=true',
+                                    'betamultiplier=10',
+                                    'replicates=10',
+                                    'randomtestpoints=0',
+                                    'replicatetype=crossvalidate',
+                                    'writebackgroundpredictions=true',
+                                    'writeplotdata=true',
+                                    'linear=true',
+                                    'quadratic=true',
+                                    'hinge=true',
+                                    'product=true',
+                                    'threshold=true',
+                                    'visible=true',
+                                    'autofeature=false',
+                                    'outputgrids=true',
+                                    'plots=true',
+                                    'maximumiterations=5000'))
+
+#### project to calibration area
+calib.pred <- dismo::predict(object = sdm.calib, x = envs_cal_sub)
+
+# average & plot
+calib.pred.avg <- mean(calib.pred)
+plot(calib.pred.avg)
+
+## projection to whole study area
+proj.full <- dismo::predict(object = sdm.calib, x = envs_proj)
+
+# average & plot
+proj.full.avg <- mean(proj.full)
+plot(proj.full.avg)
+
+## ggplot style
+library(rasterVis)
+library(extrafont)
+
+# set font
+windowsFonts(a = windowsFont('Times New Roman'))
+
+# set common theme
+map_theme <-  theme(text = element_text(family = 'a'),
+                    axis.title = element_text(size = 14, face = 'bold'),
+                    axis.title.x = element_text(margin = margin(t = 12)),
+                    axis.title.y = element_text(margin = margin(r = 12)),
+                    axis.text = element_text(size = 12),
+                    legend.text = element_text(size = 12),
+                    legend.title = element_text(size = 14, face = 'bold', margin = margin(b = 12)))
+
+# visualize
+gplot(proj.full.avg) +
+  geom_tile(aes(fill = value)) +
+  coord_equal() +
+  scale_fill_gradientn(colours = rev(terrain.colors(100)),
+                       na.value = 'transparent',
+                       name = 'Suitability') +
+  xlab('Longitude (°)') + ylab('Latitude (°)') +
+  theme_bw() +
+  map_theme
+
+#### projection to Jeju
+# import jeju mask
+jj_poly <- readOGR('D:/worldclim/NEA shapefiles/Jeju_do.shp')
+plot(envs_proj[[1]])
+
+# generate envs layers
+envs_jj <- crop(envs_proj, extent(jj_poly))
+envs_jj <- mask(envs_jj, jj_poly)
+plot(envs_jj[[6]])
+
+# project
+proj.jj <- dismo::predict(object = sdm.calib, x = envs_jj)
+
+# averge & plot
+proj.jj.avg <- mean(proj.jj)
+plot(proj.jj.avg)
+
+### ggplot style
+# point data
+jj_point <- read.csv('D:/Lycodon in Jeju/obs_coord.csv')
+colnames(jj_point) <- c('long', 'lat')
+head(jj_point)
+
+# plot
+gplot(proj.jj.avg) +
+  geom_tile(aes(fill = value)) +
+  coord_equal() +
+  scale_fill_gradientn(colors = rev(terrain.colors(100)),
+                       na.value = 'transparent',
+                       name = 'Suitability') +
+  xlab('Longitude (°)') + ylab('Latitude (°)') +
+  theme_bw() +
+  map_theme +
+  geom_polygon(data = jj_poly, aes(x = long, y = lat, group = group), fill = 'transparent', color = 'black', size = 1.2) +
+  geom_point(data = jj_point, aes(x = long, y = lat, stroke = 2), size = 6, fill = '#F8766D', shape = 24)
+  
+
+######   PART 8 ::: SDM Evaluation   ######
+## TSS
+
+## AUC.diff
+
+## Null Model
+
+
+######   PART 9 ::: Response curves   ######
+## import plot data
+bio3 <- read.csv('./SDM/resp/species_bio3.csv')
+bio5 <- read.csv('./SDM/resp/species_bio5.csv')
+bio7 <- read.csv('./SDM/resp/species_bio7.csv')
+bio19 <- read.csv('./SDM/resp/species_bio19.csv')
+elev <- read.csv('./SDM/resp/species_elev.csv')
+forest <- read.csv('./SDM/resp/species_forest.csv')
+
+## merge plot data into single dataframe
+resp <- rbind(bio3, bio5, bio7, bio19, elev, forest)
+head(resp)
+
+resp$variable <- recode_factor(resp$variable,
+                               'bio3' = 'Bio 3',
+                               'bio5' = 'Bio 5',
+                               'bio7' = 'Bio 7',
+                               'bio19' = 'Bio 19',
+                               'elev' = 'Elevation (m)',
+                               'forest' = 'Forest cover')
+
+resp$variable <- factor(resp$variable, levels = c('Bio 3', 'Bio 5', 'Bio 7', 'Bio 19', 'Elevation (m)', 'Forest cover'))
+
+## plot
+windowsFonts(a = windowsFont('Times New Roman'))
+
+resp %>%
+  ggplot(aes(x = x, y = y)) +
+  geom_line(size = 1.2, color = '#1976D2') +
+  facet_wrap(~ variable, scales = 'free') +
+  xlab('Value') + ylab('Suitaility') +
+  theme_bw() +
+  theme(text = element_text(family = 'a'),
+        axis.title = element_text(size = 14, face = 'bold'),
+        axis.title.x = element_text(margin = margin(t = 14)),
+        axis.title.y = element_text(margin = margin(r = 14)),
+        strip.text = element_text(size = 14),
+        axis.text = element_text(size = 12))
